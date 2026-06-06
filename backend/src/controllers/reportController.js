@@ -1,0 +1,845 @@
+const Report = require('../models/Report');
+const User = require('../models/User');
+const Analytics = require('../models/Analytics');
+const ReportBiomarker = require('../models/ReportBiomarker');
+const ReportAiAnalysis = require('../models/ReportAiAnalysis');
+const ReportAccess = require('../models/ReportAccess');
+const aiService = require('../services/aiService');
+const ttsService = require('../services/ttsService');
+const { createNotification } = require('../services/notificationService');
+
+exports.uploadReport = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: 'Please upload a file' });
+        }
+
+        const { patientId, patientLvId, reportName, testType } = req.body;
+        
+        let patient;
+        // If a pathology is uploading, they must supply the patient identifier
+        if (req.user.role === 'pathology') {
+            if (patientId) {
+                patient = await User.findOne({ _id: patientId, role: 'patient' });
+            } else if (patientLvId) {
+                patient = await User.findOne({ lvId: patientLvId, role: 'patient' });
+            }
+        } else {
+            // Otherwise, it is a patient uploading their own file
+            patient = await User.findById(req.user.id);
+        }
+
+        if (!patient) return res.status(404).json({ message: 'Patient not found' });
+
+        // req.file.path  → Cloudinary secure URL  (e.g. https://res.cloudinary.com/…)
+        // req.file.filename → Cloudinary public_id (e.g. reports/report-1716…)
+        const fileUrl = req.file.path;
+        const cloudinaryPublicId = req.file.filename;
+
+        // 1. Create Core Report
+        const report = new Report({
+            patientId: patient._id,
+            lvId: patient.lvId,
+            uploadedBy: req.user.id,
+            uploadedByRole: req.user.role,
+            pathologyId: req.user.role === 'pathology' ? req.user.id : null,
+            reportName,
+            testType,
+            fileUrl,
+            cloudinaryPublicId,
+        });
+
+        await report.save();
+
+        // 2. Respond IMMEDIATELY — don't make user wait for OCR + AI
+        res.status(201).json({ 
+            message: 'Report uploaded! Analysis is running in the background.', 
+            report: {
+                ...report.toObject(),
+                status: 'processing'
+            } 
+        });
+
+        // 3. Run Full AI Pipeline in background (fire-and-forget)
+        setImmediate(async () => {
+            try {
+                // report.fileUrl is now a Cloudinary HTTPS URL — pass directly to Gemini
+                console.log(`[BG PIPELINE] Pushing document to AI Engine: ${report.fileUrl}`);
+
+                let geminiResult;
+                if (report.fileUrl) {
+                    geminiResult = await aiService.extractBiomarkersFromDocument(report.fileUrl);
+                }
+
+                if (!geminiResult) throw new Error("Document analysis failed.");
+
+                const extractedText = geminiResult.rawOcrText || "Raw extracted text for " + reportName;
+                const aiBiomarkers = geminiResult.biomarkers || [];
+                const clinicalSummary = geminiResult.summary || "No summary generated.";
+
+                for (const b of aiBiomarkers) {
+                    try {
+                        const cleanNum = (val) => {
+                            if (val === null || val === undefined || val === '') return null;
+                            if (typeof val === 'number') return val;
+                            const matches = String(val).match(/[-+]?[0-9]*\.?[0-9]+/);
+                            return matches ? parseFloat(matches[0]) : null;
+                        };
+
+                        const val = cleanNum(b.value) || 0;
+                        const raw = (b.severity || 'Normal').toLowerCase();
+                        let severity = 'Normal';
+                        if (raw.includes('critical') || raw.includes('danger')) severity = 'Critical';
+                        else if (raw.includes('moderate') || raw.includes('elevated') || raw.includes('high') || raw.includes('low')) severity = 'Moderate';
+                        else if (raw.includes('mild') || raw.includes('slight') || raw.includes('border')) severity = 'Mild';
+
+                        const lastResult = await ReportBiomarker.findOne({ 
+                            patientId: patient._id, 
+                            biomarkerName: String(b.name || 'Unknown').toLowerCase() 
+                        }).sort({ testDate: -1 });
+
+                        let trend = 'Stable';
+                        if (lastResult) {
+                            if (val > lastResult.value) trend = 'Increasing';
+                            else if (val < lastResult.value) trend = 'Decreasing';
+                        }
+
+                        await ReportBiomarker.create({
+                            reportId: report._id,
+                            patientId: patient._id,
+                            biomarkerName: String(b.name || 'Unknown').toLowerCase(),
+                            value: val,
+                            unit: String(b.unit || ''),
+                            referenceMin: cleanNum(b.min),
+                            referenceMax: cleanNum(b.max),
+                            isAbnormal: severity !== 'Normal',
+                            severity,
+                            interpretation: b.interpretation || `Value detected as ${trend.toLowerCase()}.`,
+                            confidence: b.confidence || 0.9,
+                            source: 'ai_extracted',
+                            testDate: report.createdAt
+                        });
+                    } catch (bioErr) {
+                        console.warn(`[BG PIPELINE] Skipping biomarker "${b.name}":`, bioErr.message);
+                    }
+                }
+
+                console.log(`[BG PIPELINE] Generating doctor clinical brief...`);
+                const doctorBrief = await aiService.generateDoctorBrief(extractedText, aiBiomarkers);
+
+                console.log(`[BG PIPELINE] Saving Clinical Observation...`);
+                await ReportAiAnalysis.findOneAndUpdate(
+                    { reportId: report._id },
+                    { ocrText: extractedText, summaryEn: clinicalSummary, doctorBriefEn: doctorBrief },
+                    { upsert: true, new: true }
+                );
+
+                report.status = 'ready';
+                await report.save();
+                console.log(`[BG PIPELINE] ✅ Fully complete for Report ${report._id}`);
+            } catch (pipelineErr) {
+                console.error('[BG PIPELINE ERROR]:', pipelineErr.message);
+                report.status = 'failed';
+                await report.save();
+            }
+        });
+
+        // TRIGGER NOTIFICATION
+        if (req.user.role === 'pathology') {
+            await createNotification({
+                recipient: patient._id,
+                actor: req.user.id,
+                type: 'new_report',
+                message: `New lab results for ${reportName} are now available.`,
+                link: `/dashboard/patient/insights?id=${report._id}`
+            });
+        }
+    } catch (error) {
+        console.error('Upload Error:', error);
+        if (!res.headersSent) {
+            res.status(500).json({ message: 'Server Error' });
+        }
+    }
+};
+
+exports.getReports = async (req, res) => {
+    try {
+        let query = { isDeleted: false };
+        if (req.user.role === 'patient') {
+            query.patientId = req.user.id;
+        } else if (req.user.role === 'pathology') {
+            query.pathologyId = req.user.id;
+        } else if (req.user.role === 'doctor') {
+            // Find reports this doctor has access to
+            const access = await ReportAccess.find({ doctorId: req.user.id, status: 'approved' }).select('reportId');
+            const reportIds = access.map(a => a.reportId);
+            query._id = { $in: reportIds };
+        } // admin sees all
+
+        // Note: For full robustness, you might populate patientId and pathologyId 
+        const reports = await Report.find(query)
+            .sort({ reportDate: -1 })
+            .populate('patientId', 'name lvId email')
+            .populate('pathologyId', 'name lvId')
+            .lean();
+            
+        // Batch fetch AI Summaries and Biomarkers
+        const reportIds = reports.map(r => r._id);
+        const [analyses, biomarkers] = await Promise.all([
+            ReportAiAnalysis.find({ reportId: { $in: reportIds } }).select('reportId summaryEn').lean(),
+            ReportBiomarker.find({ reportId: { $in: reportIds } }).lean()
+        ]);
+
+        const analysisMap = analyses.reduce((acc, a) => ({ ...acc, [a.reportId.toString()]: a.summaryEn }), {});
+        const biomarkerMap = biomarkers.reduce((acc, b) => {
+            const rId = b.reportId.toString();
+            if (!acc[rId]) acc[rId] = {};
+            acc[rId][b.biomarkerName] = {
+                value: b.value,
+                unit: b.unit || '',
+                min: b.referenceMin,
+                max: b.referenceMax,
+                isAbnormal: b.isAbnormal,
+                severity: b.severity
+            };
+            return acc;
+        }, {});
+
+        const reportsWithData = reports.map(r => {
+            const lastNote = r.doctorNotes && r.doctorNotes.length > 0 
+                ? r.doctorNotes[r.doctorNotes.length - 1].note 
+                : "";
+            return {
+                ...r,
+                doctorComment: lastNote,
+                aiSummary: analysisMap[r._id.toString()] || null,
+                extractedData: biomarkerMap[r._id.toString()] || {}
+            };
+        });
+
+        res.status(200).json(reportsWithData);
+    } catch (error) {
+        console.error('Get Reports Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+exports.getSharedReportsForDoctor = async (req, res) => {
+    try {
+        const doctorId = req.user.id;
+
+        // 1. Find all patients where doctorAccess includes the given doctorId
+        const patients = await User.find({ role: 'patient', doctorAccess: doctorId }).select('_id');
+        
+        if (!patients || patients.length === 0) {
+            return res.status(200).json([]); // Return empty if no patients found
+        }
+
+        const patientIds = patients.map(p => p._id);
+
+        // 2. Fetch all reports linked to those patients
+        const reports = await Report.find({ patientId: { $in: patientIds }, isDeleted: false })
+            .sort({ reportDate: -1 })
+            .populate('patientId', 'name lvId email')
+            .populate('pathologyId', 'name lvId')
+            .lean();
+
+        // 3. Batch fetch AI Summaries and Biomarkers
+        const reportIds = reports.map(r => r._id);
+        const [analyses, biomarkers] = await Promise.all([
+            ReportAiAnalysis.find({ reportId: { $in: reportIds } }).select('reportId summaryEn').lean(),
+            ReportBiomarker.find({ reportId: { $in: reportIds } }).lean()
+        ]);
+
+        const analysisMap = analyses.reduce((acc, a) => ({ ...acc, [a.reportId.toString()]: a.summaryEn }), {});
+        
+        // Group biomarkers by reportId as an object for the frontend
+        const biomarkerMap = biomarkers.reduce((acc, b) => {
+            const rId = b.reportId.toString();
+            if (!acc[rId]) acc[rId] = {};
+            acc[rId][b.biomarkerName] = {
+                value: b.value,
+                unit: b.unit || '',
+                min: b.referenceMin,
+                max: b.referenceMax,
+                isAbnormal: b.isAbnormal,
+                severity: b.severity
+            };
+            return acc;
+        }, {});
+
+        const reportsWithData = reports.map(r => {
+            const lastNote = r.doctorNotes && r.doctorNotes.length > 0 
+                ? r.doctorNotes[r.doctorNotes.length - 1].note 
+                : "";
+            return {
+                ...r,
+                doctorComment: lastNote,
+                aiSummary: analysisMap[r._id.toString()] || null,
+                extractedData: biomarkerMap[r._id.toString()] || {}
+            };
+        });
+
+        res.status(200).json(reportsWithData);
+    } catch (error) {
+        console.error('Get Shared Reports Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+exports.getReportById = async (req, res) => {
+    try {
+        const report = await Report.findById(req.params.id)
+            .populate('patientId', 'name lvId email doctorAccess')
+            .lean(); // Return plain object so we can attach relational data
+            
+        if (!report) return res.status(404).json({ message: 'Report not found' });
+
+        // DOCTOR ACCESS CONTROL Check
+        if (req.user.role === 'doctor') {
+            const patient = report.patientId;
+            if (!patient || !patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id)) {
+                return res.status(403).json({ message: 'Access Denied: You are not authorized to view this report.' });
+            }
+        }
+
+        // Fetch associated relational data
+        const biomarkers = await ReportBiomarker.find({ reportId: report._id });
+        const aiAnalysis = await ReportAiAnalysis.findOne({ reportId: report._id });
+
+        // Map back to legacy frontend format temporarily until frontend is fully migrated
+        const responseData = {
+            ...report,
+            extractedData: biomarkers.reduce((acc, b) => ({ ...acc, [b.biomarkerName]: b.value }), {}),
+            biomarkers: biomarkers, // Added so new Insights page can render range bars
+            aiSummary: aiAnalysis?.summaryEn || null,
+            voiceSummaryUrl: aiAnalysis?.audioUrls?.get('en') || null
+        };
+
+        res.status(200).json(responseData);
+    } catch (error) {
+        console.error('Get Report By Id Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+exports.getReportStatus = async (req, res) => {
+    try {
+        const report = await Report.findById(req.params.id).select('status createdAt');
+        if (!report) return res.status(404).json({ message: 'Report not found' });
+        res.status(200).json({ 
+            status: report.status, 
+            createdAt: report.createdAt,
+            isProcessing: report.status === 'processing'
+        });
+    } catch (error) {
+        console.error('Get Report Status Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+exports.getReportSummary = async (req, res) => {
+    try {
+        const report = await Report.findById(req.params.id).populate('patientId', 'doctorAccess');
+        if (!report) return res.status(404).json({ message: 'Report not found' });
+
+        // DOCTOR ACCESS CONTROL Check
+        if (req.user.role === 'doctor') {
+            const patient = report.patientId;
+            if (!patient || !patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id)) {
+                return res.status(403).json({ message: 'Access Denied: You are not authorized to view this summary.' });
+            }
+        }
+
+        let analysis = await ReportAiAnalysis.findOne({ reportId: req.params.id });
+        if (!analysis) {
+            analysis = await ReportAiAnalysis.findOneAndUpdate(
+                { reportId: req.params.id },
+                { ocrText: 'Missing OCR data.', summaryEn: '' },
+                { upsert: true, new: true }
+            );
+        }
+        
+        const language = req.query.lang || 'en';
+        const force = req.query.force === 'true';
+
+        // Use the new single-pass engine if summary is missing OR force-recalculating
+        if (!analysis.summaryEn || force || (language !== 'en' && !analysis.translations.get(language))) {
+            console.log(`[AI CONTROLLER] Generating/Updating analysis for ${req.params.id}...`);
+            const result = await aiService.analyzeReportUniversal(analysis.ocrText, language);
+            
+            if (language === 'en') {
+                analysis.summaryEn = result.summary;
+            } else {
+                if (!analysis.translations) analysis.translations = new Map();
+                analysis.translations.set(language, result.summary);
+            }
+            await analysis.save();
+        }
+        
+        const summary = language === 'en' ? analysis.summaryEn : analysis.translations.get(language);
+        const voiceUrl = analysis.audioUrls?.get(language);
+
+        res.status(200).json({ summary, voiceSummaryUrl: voiceUrl });
+    } catch (error) {
+        console.error('Summary Generation Fatal:', error.message);
+        res.status(500).json({ message: 'AI processing failed locally. Please check Ollama logs.' });
+    }
+};
+
+exports.generateVoice = async (req, res) => {
+    try {
+        const { reportId, patientId, language, text } = req.body;
+        const isDoctor = req.user.role === 'doctor';
+        
+        const langCode = language?.toLowerCase().includes('hi') ? 'hi'
+            : language?.toLowerCase().includes('mr') ? 'mr'
+            : language?.toLowerCase().includes('te') ? 'te' : 'en';
+
+        const rewriteService = require('../services/rewriteService');
+        const scriptService = require('../services/scriptService');
+
+        // ─── MODE 1: LONGITUDINAL PATIENT SUMMARY (DOCTOR ONLY) ───────────────
+        if (patientId && !reportId && isDoctor) {
+            const patient = await User.findOne({ _id: patientId, role: 'patient' });
+            if (!patient) return res.status(404).json({ message: 'Patient not found' });
+
+            if (!patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id)) {
+                return res.status(403).json({ message: 'Access Denied: Permission required for longitudinal analysis.' });
+            }
+
+            // Fetch trends
+            const biomarkers = await ReportBiomarker.find({ patientId: patient._id }).sort({ testDate: 1 });
+            const trends = biomarkers.reduce((acc, curr) => {
+                const name = curr.biomarkerName;
+                if (!acc[name]) acc[name] = { parameter: name, values: [] };
+                acc[name].values.push({ value: curr.value, unit: curr.unit, isAbnormal: curr.isAbnormal });
+                return acc;
+            }, {});
+
+            const voiceScript = await rewriteService.rewriteAsLongitudinal(patient.name, Object.values(trends), langCode);
+            const audioUrl = await ttsService.generateAndStoreAudio(voiceScript, langCode);
+
+            return res.status(200).json({ audioUrl, voiceScript, language: langCode, mode: 'longitudinal' });
+        }
+
+        // ─── MODE 2: SINGLE REPORT SUMMARY (DOCTOR OR PATIENT) ────────────────
+        let report = null;
+        if (reportId) {
+            report = await Report.findById(reportId).populate('patientId', 'name doctorAccess');
+            if (!report) return res.status(404).json({ message: 'Report not found' });
+
+            if (isDoctor) {
+                const patient = report.patientId;
+                if (!patient || !patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id)) {
+                    return res.status(403).json({ message: 'Access Denied: Unauthorized report access.' });
+                }
+            }
+        }
+
+        let summaryText = text;
+        let analysis = reportId ? await ReportAiAnalysis.findOne({ reportId }) : null;
+
+        if (!analysis && reportId) {
+            analysis = await ReportAiAnalysis.findOneAndUpdate(
+                { reportId },
+                { ocrText: 'Regenerating insights.', summaryEn: '' },
+                { upsert: true, new: true }
+            );
+        }
+
+        // DOCTOR BRANCH (Single Report)
+        if (isDoctor && reportId) {
+            const doctorCacheKey = `doctor_${langCode}`;
+            if (analysis?.audioUrls?.get(doctorCacheKey)) {
+                return res.status(200).json({ 
+                    audioUrl: analysis.audioUrls.get(doctorCacheKey), 
+                    voiceScript: analysis.translations?.get(`script_${doctorCacheKey}`) || '', 
+                    cached: true 
+                });
+            }
+
+            if (!summaryText && analysis) summaryText = analysis.summaryEn || '';
+            const biomarkers = await ReportBiomarker.find({ reportId }).lean();
+            const clinicalText = await rewriteService.rewriteAsClinical(summaryText, report.patientId?.name, biomarkers, langCode);
+            const voiceScript = clinicalText.replace(/\*\*/g, '').replace(/\n+/g, ' ').slice(0, 400).trim();
+
+            const audioUrl = await ttsService.generateAndStoreAudio(voiceScript, langCode);
+            if (analysis) {
+                if (!analysis.audioUrls) analysis.audioUrls = new Map();
+                if (!analysis.translations) analysis.translations = new Map();
+                analysis.audioUrls.set(doctorCacheKey, audioUrl);
+                analysis.translations.set(`script_${doctorCacheKey}`, voiceScript);
+                await analysis.save();
+            }
+            return res.status(200).json({ audioUrl, voiceScript, language: langCode });
+        }
+
+        // PATIENT BRANCH (Single Report)
+        if (!summaryText && analysis) {
+            summaryText = analysis.translations?.get(langCode) || analysis.summaryEn;
+        }
+        if (!summaryText) return res.status(400).json({ message: 'No summary text available.' });
+
+        const cachedUrl = analysis?.audioUrls?.get(langCode);
+        const cachedScript = analysis?.translations?.get(`script_${langCode}`);
+        if (cachedUrl) return res.status(200).json({ audioUrl: cachedUrl, voiceScript: cachedScript || '', cached: true });
+
+        const empatheticText = await rewriteService.rewriteAsEmpathetic(summaryText, langCode);
+        const script = scriptService.buildVoiceScript(empatheticText, language);
+        const audioUrl = await ttsService.generateAndStoreAudio(script, langCode);
+
+        if (analysis) {
+            if (!analysis.audioUrls) analysis.audioUrls = new Map();
+            if (!analysis.translations) analysis.translations = new Map();
+            analysis.audioUrls.set(langCode, audioUrl);
+            analysis.translations.set(`script_${langCode}`, script);
+            await analysis.save();
+        }
+        res.status(200).json({ audioUrl, voiceScript: script, language: langCode });
+    } catch (error) {
+        console.error('Voice Generation Error:', error.message);
+        res.status(500).json({ message: 'Voice generation failed.' });
+    }
+};
+
+
+exports.grantAccess = async (req, res) => {
+    try {
+        const { reportId, doctorId } = req.body;
+        
+        const report = await Report.findOne({ _id: reportId, patientId: req.user.id });
+        if (!report) return res.status(404).json({ message: 'Report not found' });
+
+        await ReportAccess.findOneAndUpdate(
+            { reportId, doctorId },
+            { patientId: req.user.id, status: 'approved' },
+            { upsert: true, new: true }
+        );
+
+        // TRIGGER NOTIFICATION: Doctor notified of access
+        await createNotification({
+            recipient: doctorId,
+            actor: req.user.id,
+            type: 'access_granted',
+            message: `${req.user.name} has granted you access to their reports.`,
+            link: `/dashboard/doctor/patient/${req.user.id}/dashboard`
+        });
+
+        res.status(200).json({ message: 'Access granted successfully' });
+    } catch (error) {
+        console.error('Grant Access Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+// Utility to add backward compatibility for doctorComment
+const mapReportNotes = (report) => {
+    const reportObj = report.toObject ? report.toObject() : report;
+    const lastNote = reportObj.doctorNotes && reportObj.doctorNotes.length > 0 
+        ? reportObj.doctorNotes[reportObj.doctorNotes.length - 1].note 
+        : "";
+    return { ...reportObj, doctorComment: lastNote };
+};
+
+exports.getPatientReports = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const requesterId = req.user.id;
+        const requesterRole = req.user.role;
+
+        if (requesterRole === 'patient' && requesterId !== id) {
+            return res.status(403).json({ message: "Access Denied: You cannot view another patient's reports." });
+        }
+
+        if (requesterRole === 'doctor') {
+            const patient = await User.findOne({ _id: id, role: 'patient', doctorAccess: requesterId });
+            if (!patient) {
+                return res.status(403).json({ message: "Access Denied: You do not have permission to view this patient's history." });
+            }
+        }
+
+        const reports = await Report.find({ patientId: id, isDeleted: false })
+            .sort({ reportDate: -1 })
+            .populate('pathologyId', 'name lvId');
+
+        res.status(200).json(reports.map(mapReportNotes));
+    } catch (error) {
+        console.error('Get Patient Reports Error:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
+    }
+};
+
+exports.getPatientReportsForDoctor = async (req, res) => {
+    try {
+        const { patientId } = req.params;
+        const doctorId = req.user.id;
+
+        const patient = await User.findOne({ _id: patientId, role: 'patient', doctorAccess: doctorId });
+        if (!patient) {
+            return res.status(403).json({ message: "Access Denied: You do not have permission to view this patient's history." });
+        }
+
+        const reports = await Report.find({ patientId, isDeleted: false })
+            .sort({ reportDate: -1 })
+            .populate('pathologyId', 'name lvId');
+
+        res.status(200).json(reports.map(mapReportNotes));
+    } catch (error) {
+        console.error('Get Patient Reports For Doctor Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+exports.addDoctorNote = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { note } = req.body;
+
+        if (!note) {
+            return res.status(400).json({ message: 'Note content is required' });
+        }
+
+        const report = await Report.findById(id).populate('patientId', 'doctorAccess');
+        if (!report) {
+            return res.status(404).json({ message: 'Report not found' });
+        }
+
+        if (req.user.role === 'doctor') {
+            const patient = report.patientId;
+            if (!patient || !patient.doctorAccess || !patient.doctorAccess.some(docId => docId.toString() === req.user.id)) {
+                return res.status(403).json({ message: 'Access Denied: You are not authorized to add a note to this report.' });
+            }
+        } else if (req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Only healthcare providers can add clinical notes.' });
+        }
+
+        report.doctorNotes.push({
+            note,
+            doctorId: req.user.id,
+            createdAt: new Date()
+        });
+
+        await report.save();
+
+        // TRIGGER NOTIFICATION: Patient notified of clinical note
+        await createNotification({
+            recipient: report.patientId._id || report.patientId,
+            actor: req.user.id,
+            type: 'clinical_note',
+            message: `Dr. ${req.user.name} added a clinical note to your ${report.reportName} report.`,
+            link: `/dashboard/patient/insights?id=${report._id}`
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'Note added successfully',
+            doctorNotes: report.doctorNotes,
+            doctorComment: note // Return for compatibility
+        });
+    } catch (error) {
+        console.error('Add Doctor Note Error:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
+    }
+};
+
+exports.getReportDetails = async (req, res) => {
+    try {
+        const { reportId } = req.params;
+
+        const report = await Report.findById(reportId)
+            .populate('patientId', 'name lvId email doctorAccess')
+            .populate('pathologyId', 'name lvId');
+            
+        if (!report) return res.status(404).json({ message: 'Report not found' });
+
+        // Security check for doctors
+        if (req.user.role === 'doctor') {
+            const patient = report.patientId;
+            if (!patient || !patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id)) {
+                return res.status(403).json({ message: 'Access Denied: You are not authorized to view this report.' });
+            }
+        }
+
+        const biomarkers = await ReportBiomarker.find({ reportId });
+        const aiAnalysis = await ReportAiAnalysis.findOne({ reportId });
+
+        res.status(200).json({
+            report,
+            biomarkers,
+            aiSummary: aiAnalysis?.summaryEn || null,
+            ocrText: aiAnalysis?.ocrText || null,
+            abnormalities: biomarkers.filter(b => b.isAbnormal || b.severity !== 'Normal')
+        });
+    } catch (error) {
+        console.error('Get Report Details Error:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
+    }
+};
+
+exports.getPatientTrends = async (req, res) => {
+    try {
+        const { patientId } = req.params;
+
+        // Verify doctor has access
+        if (req.user.role === 'doctor') {
+            const patient = await User.findOne({ _id: patientId, role: 'patient', doctorAccess: req.user.id });
+            if (!patient) {
+                return res.status(403).json({ message: "Access Denied: You do not have permission to view trends for this patient." });
+            }
+        }
+
+        const data = await ReportBiomarker.find({ patientId }).sort({ testDate: 1 });
+        
+        // Group by biomarkerName
+        const trends = data.reduce((acc, curr) => {
+            const name = curr.biomarkerName.toLowerCase();
+            if (!acc[name]) acc[name] = [];
+            acc[name].push({
+                value: curr.value,
+                unit: curr.unit,
+                date: curr.testDate,
+                severity: curr.severity,
+                isAbnormal: curr.isAbnormal
+            });
+            return acc;
+        }, {});
+
+        res.status(200).json(trends);
+    } catch (error) {
+        console.error('Get Patient Trends Error:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
+    }
+};
+
+exports.getPatientDashboardData = async (req, res) => {
+    try {
+        const { id: patientId } = req.params;
+
+        // 1. Security & Patient Info
+        const patient = await User.findOne({ _id: patientId, role: 'patient' })
+            .select('name email lvId doctorAccess');
+        
+        if (!patient) return res.status(404).json({ message: 'Patient not found' });
+
+        if (req.user.role === 'doctor' && (!patient.doctorAccess || !patient.doctorAccess.some(id => id.toString() === req.user.id))) {
+            return res.status(403).json({ message: 'Access Denied: You do not have permission to view this patient dashboard.' });
+        }
+
+        // 2. Parallel Fetching for Efficiency
+        const [reports, biomarkers, aiAnalyses] = await Promise.all([
+            Report.find({ patientId, isDeleted: false }).sort({ reportDate: -1 }).populate('pathologyId', 'name'),
+            ReportBiomarker.find({ patientId }).sort({ testDate: 1 }),
+            ReportAiAnalysis.find({ reportId: { $in: (await Report.find({ patientId, isDeleted: false }).select('_id')).map(r => r._id) } })
+        ]);
+
+        // 3. Assemble Trends
+        const trends = biomarkers.reduce((acc, curr) => {
+            const name = curr.biomarkerName;
+            if (!acc[name]) acc[name] = [];
+            acc[name].push({
+                value: curr.value,
+                unit: curr.unit,
+                date: curr.testDate,
+                isAbnormal: curr.isAbnormal
+            });
+            return acc;
+        }, {});
+
+        // 4. Combine Reports with their analysis and COMPARISON logic
+        const enrichedReports = reports.map((report, index) => {
+            const reportBiomarkers = biomarkers.filter(b => b.reportId.toString() === report._id.toString());
+            const analysis = aiAnalyses.find(a => a.reportId.toString() === report._id.toString());
+            
+            // Comparison with previous report (index + 1 because reports are sorted by date DESC)
+            const previousReport = reports[index + 1];
+            const previousBiomarkers = previousReport 
+                ? biomarkers.filter(b => b.reportId.toString() === previousReport._id.toString())
+                : [];
+
+            const biomarkersWithComparison = reportBiomarkers.map(b => {
+                const prev = previousBiomarkers.find(pb => pb.biomarkerName === b.biomarkerName);
+                let trendDirection = 'stable';
+                let improvementStatus = 'neutral';
+
+                if (prev) {
+                    if (b.value > prev.value) trendDirection = 'up';
+                    else if (b.value < prev.value) trendDirection = 'down';
+
+                    // Clinical Improving/Deteriorating logic (Simplified)
+                    if (prev.isAbnormal && !b.isAbnormal) improvementStatus = 'improving';
+                    else if (!prev.isAbnormal && b.isAbnormal) improvementStatus = 'deteriorating';
+                    else if (b.isAbnormal && prev.isAbnormal) {
+                        // Check if moving toward normal range
+                        const mid = (b.referenceMin + b.referenceMax) / 2 || prev.value;
+                        if (Math.abs(b.value - mid) < Math.abs(prev.value - mid)) improvementStatus = 'improving';
+                        else improvementStatus = 'deteriorating';
+                    }
+                }
+
+                return {
+                    ...b.toObject(),
+                    comparison: prev ? {
+                        previousValue: prev.value,
+                        trendDirection,
+                        improvementStatus
+                    } : null
+                };
+            });
+
+            return {
+                ...report.toObject(),
+                biomarkers: biomarkersWithComparison,
+                ai: analysis ? {
+                    summary: analysis.summaryEn,
+                    doctorBrief: analysis.doctorBriefEn || null,
+                    ocrText: analysis.ocrText,
+                    insights: analysis.insightsEn,
+                    suggestions: analysis.suggestions || []
+                } : null,
+                abnormalities: biomarkersWithComparison.filter(b => b.isAbnormal || b.severity !== 'Normal')
+            };
+        });
+
+        res.status(200).json({
+            patient,
+            reports: enrichedReports,
+            trends: Object.entries(trends).map(([parameter, values]) => ({ parameter, values }))
+        });
+    } catch (error) {
+        console.error('Dashboard Aggregation Error:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
+    }
+};
+
+exports.shareReport = async (req, res) => {
+    try {
+        const { reportId, email, note } = req.body;
+        const patient = await User.findById(req.user.id).select('name email _id');
+        if (!patient) return res.status(404).json({ message: 'Patient not found' });
+
+        // Verify the report belongs to the patient
+        const report = await Report.findOne({ _id: reportId, patientId: req.user.id }).select('reportName _id');
+        if (!report) return res.status(404).json({ message: 'Report not found or not yours' });
+
+        // Find the doctor by email in our system
+        const doctor = await User.findOne({ email, role: 'doctor' }).select('_id name');
+
+        if (doctor) {
+            await createNotification({
+                recipient: doctor._id,
+                actor: patient._id,
+                type: 'access_granted',
+                message: `${patient.name} has shared their report "${report.reportName}" with you.${note ? ' Note: ' + note : ''} View it in your dashboard.`,
+                link: `/dashboard/doctor/patient/${patient._id}/dashboard`,
+            });
+            return res.status(200).json({ success: true, message: `Report shared with Dr. ${doctor.name}` });
+        }
+
+        // Doctor not found in system — return success so frontend uses clipboard fallback
+        return res.status(200).json({ success: false, message: 'Doctor not found in system. Use the link to share manually.' });
+    } catch (error) {
+        console.error('Share Report Error:', error);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};

@@ -1,0 +1,12 @@
+Testing with file: C:\projects\KanakLabV\Lbvault\backend\uploads\reports\report-1775546887485-cbc_lab_report.pdf
+[OCR PIPELINE] Extracting raw text from C:\projects\KanakLabV\Lbvault\backend\uploads\reports\report-1775546887485-cbc_lab_report.pdf using Gemini 2.0 Flash...
+Result extracted text length: 63
+Result extracted text preview: Native parsing failed. Please upload a clear Text PDF or image.
+Biomarkers: []
+\n---STDERR---\n[EXTRACTION FATAL EXCEPTION] [GoogleGenerativeAI Error]: Error fetching from https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent: [404 Not Found] models/gemini-1.5-flash is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods. Error: [GoogleGenerativeAI Error]: Error fetching from https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent: [404 Not Found] models/gemini-1.5-flash is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.
+    at handleResponseNotOk (C:\projects\KanakLabV\Lbvault\backend\node_modules\@google\generative-ai\dist\index.js:434:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at async makeRequest (C:\projects\KanakLabV\Lbvault\backend\node_modules\@google\generative-ai\dist\index.js:403:9)
+    at async generateContent (C:\projects\KanakLabV\Lbvault\backend\node_modules\@google\generative-ai\dist\index.js:867:22)
+    at async exports.extractBiomarkersFromDocument (C:\projects\KanakLabV\Lbvault\backend\services\aiService.js:31:32)
+    at async test (C:\projects\KanakLabV\Lbvault\backend\test_pipeline.js:9:24)

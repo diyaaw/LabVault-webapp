@@ -1,0 +1,5 @@
+Testing with file: C:\projects\KanakLabV\Lbvault\backend\uploads\reports\report-1775546887485-cbc_lab_report.pdf
+[OCR PIPELINE] Extracting raw text from C:\projects\KanakLabV\Lbvault\backend\uploads\reports\report-1775546887485-cbc_lab_report.pdf using Gemini 2.0 Flash...
+Result extracted text length: 63
+Result extracted text preview: Native parsing failed. Please upload a clear Text PDF or image.
+Biomarkers: []

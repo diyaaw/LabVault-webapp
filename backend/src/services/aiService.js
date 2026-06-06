@@ -1,0 +1,329 @@
+const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+const pdfParseLib = require('pdf-parse');
+const pdfParse = typeof pdfParseLib === 'function' ? pdfParseLib : (pdfParseLib.PDFParse || pdfParseLib.default || pdfParseLib);
+
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const FormData = require('form-data');
+
+exports.extractBiomarkersFromDocument = async (filePath) => {
+    try {
+        console.log(`[OCR PIPELINE] Pushing document to Refactored Python OCR Service: ${filePath}`);
+        let extractedText = 'No text cleanly extracted from this file type.';
+
+        try {
+            const formData = new FormData();
+            formData.append('file', fs.createReadStream(filePath));
+            formData.append('enable_preprocessing', 'true');
+
+            // Send multipart request to the Refactored Python OCR Service
+            const response = await axios.post('http://127.0.0.1:5001/ocr/process', formData, {
+                headers: {
+                    ...formData.getHeaders()
+                }
+            });
+
+            if (response.data && response.data.status === 'success') {
+                extractedText = response.data.text;
+                console.log(`[OCR PIPELINE] Received OCR text. Length: ${response.data.length}`);
+            } else {
+                throw new Error("Python OCR service failed or returned error structure.");
+            }
+        } catch (apiErr) {
+            console.error('[OCR PIPELINE ERROR] Python Service failed:', apiErr.message);
+            // Fallback for native text PDF parsing if service fails
+            if (filePath.toLowerCase().endsWith('.pdf')) {
+                console.log('[OCR PIPELINE] Falling back to pdf-parse for native PDF text extraction...');
+                const dataBuffer = fs.readFileSync(filePath);
+                try {
+                    // Handle standard pdf-parse function call
+                    const pdf = require('pdf-parse');
+                    const pdfData = await pdf(dataBuffer);
+                    if (pdfData && pdfData.text) extractedText = pdfData.text;
+                } catch (pdfErr) {
+                    console.error('[OCR PIPELINE ERROR] pdf-parse failed:', pdfErr.message);
+                }
+            }
+        }
+
+        console.log(`[OCR PIPELINE] Final Extracted Text Length: ${extractedText.length}`);
+        
+        // Force 'en' fallback if result is poor
+        const result = await exports.analyzeReportUniversal(extractedText, 'en');
+
+        console.log(`[AI EXTRACTION] Extracted ${result.biomarkers?.length || 0} biomarkers.`);
+        if (result.biomarkers && result.biomarkers.length > 0) {
+            console.log(`[AI EXTRACTION] List: ${result.biomarkers.map(b => b.clinical_name || b.name).join(', ')}`);
+        }
+
+        return {
+            rawOcrText: extractedText,
+            biomarkers: Array.isArray(result.biomarkers) ? result.biomarkers : [],
+            summary: result.summary || 'AI Analysis was unable to generate a summary from this document.'
+        };
+    } catch (error) {
+        console.error('[EXTRACTION FATAL EXCEPTION]', error.message);
+        return {
+            rawOcrText: 'Native parsing failed.',
+            biomarkers: [],
+            summary: 'We were unable to analyze this document structure. Please upload a high-quality PDF or Image.'
+        };
+    }
+};
+
+exports.analyzeReportUniversal = async (ocrText, language = 'en') => {
+    try {
+        let safeText = String(ocrText || '').substring(0, 4000);
+        if (safeText.trim().length === 0) {
+            return {
+                biomarkers: [],
+                summary: 'No valid text found in report.'
+            };
+        }
+
+        // Build language-specific instruction
+        const langInstructions = {
+            hi: `LANGUAGE RULE (CRITICAL): Write the ENTIRE summary in Hindi (हिंदी). 
+Every sentence, every phrase, every word MUST be in Hindi script (Devanagari).
+ONLY keep these in English: medical test names (Hemoglobin, ALT, AST, HbA1c, etc.), units (mg/dL, g/dL, U/L), and numeric values.
+Example of correct style: "आपके **Hemoglobin** का स्तर 10.5 g/dL है, जो सामान्य से थोड़ा कम है।"
+DO NOT mix random English words. All explanations, all advice, all headings must be in Hindi.`,
+            mr: `LANGUAGE RULE (CRITICAL): संपूर्ण सारांश मराठी भाषेत लिहा.
+प्रत्येक वाक्य, प्रत्येक शब्द मराठीत असणे आवश्यक आहे.
+फक्त हे इंग्रजीत ठेवा: वैद्यकीय चाचणीची नावे (Hemoglobin, ALT, AST), एकके (mg/dL, g/dL), आणि संख्यात्मक मूल्ये.
+उदाहरण: "तुमच्या **Hemoglobin** ची पातळी 10.5 g/dL आहे, जी सामान्यपेक्षा थोडी कमी आहे."
+इतर सर्व स्पष्टीकरण, सल्ला आणि शीर्षके मराठीत असावीत.`,
+            te: `LANGUAGE RULE (CRITICAL): మొత్తం సారాంశాన్ని తెలుగులో రాయండి.
+ప్రతి వాక్యం, ప్రతి మాట తెలుగులో ఉండాలి.
+ఇవి మాత్రమే ఇంగ్లీషులో ఉంచండి: వైద్య పరీక్ష పేర్లు (Hemoglobin, ALT, AST), యూనిట్లు (mg/dL), మరియు సంఖ్యా విలువలు.
+ఉదాహరణ: "మీ **Hemoglobin** స్థాయి 10.5 g/dL గా ఉంది, ఇది సాధారణం కంటే కొంచెం తక్కువ."
+మిగిలిన అన్ని వివరణలు, సూచనలు తెలుగులో రాయండి.`,
+            en: `LANGUAGE RULE: Write the summary in clear, simple English. Use emojis and bold headers.`
+        };
+
+        const langCode = String(language).toLowerCase().substring(0, 2);
+        const langRule = langInstructions[langCode] || langInstructions['en'];
+
+        const prompt = `You are an empathetic Health Guide and Medical Interpreter.
+Your task is to analyze the following medical report OCR text and explain it to a NON-MEDICAL person in a warm, encouraging, and clear tone.
+
+Perform TWO tasks in one pass:
+1. Extract EVERY SINGLE measurable parameter/biomarker found in the text into the JSON array. Do not miss any!
+CRITICAL RULE 1: Extract ALL valid parameters (e.g., Creatinine, Urea, Sodium, Potassium, Hemoglobin, etc.) that have a measured result in the text.
+CRITICAL RULE 2: ABSOLUTELY DO NOT treat the Title or Category of the report (e.g., "Kidney Function Test", "Liver Panel", "CBC", "Thyroid Profile") as a biomarker itself. A biomarker must be a specific test item with a distinct measured value. 
+CRITICAL RULE 3: DO NOT generate, make up, guess, or infer any parameters that are not explicitly present in the text.
+2. Generate a highly patient-friendly summary. Imagine you are talking to a concerned person at home:
+   - **HIGHLIGHT ABNORMALITIES**: If a value is outside the reference range, highlight it with ⚠️ and explain it prominently.
+   - Use simple words (e.g., instead of "Hyperlipidemia", use "Higher levels of fat or cholesterol in your blood").
+   - Explain WHY a certain marker matters (e.g., "This test helps us see how well your liver is cleaning your system").
+   - Use a tone that is optimistic yet cautious, providing clear next steps.
+
+Output strictly a valid JSON object with this exact structure:
+{
+  "biomarkers": [
+    {
+      "name": "Friendly test name (e.g., Blood Sugar)",
+      "clinical_name": "Exact clinical name EXACTLY AS IT APPEARS in text (e.g., HbA1c)",
+      "value": number (The actual test result value),
+      "unit": "string",
+      "min": number|null (MIN reference value),
+      "max": number|null (MAX reference value),
+      "severity": "Normal|Mild|Moderate|Critical", (Calculate this strictly: if value is outside min/max range, it MUST NOT be "Normal"),
+      "interpretation": "A very simple 1-sentence explanation. Use 'High' or 'Low' explicitly if abnormal.",
+      "confidence": number
+    }
+  ],
+  "summary": "string (A warm, 3-4 paragraph message. Start with a greeting. If there are abnormalities, start with a section called '🚨 Important Abnormalities' and list them. Then use simple analogies for the rest. End with 'Your Next Steps' with emojis.)"
+}
+
+${langRule}
+
+General Rules:
+- STRICT RULE ON REFERENCE RANGES: Extract the reference ranges/normal ranges from the text itself. DO NOT use your internal knowledge to fill in reference ranges. If it's missing in the text, use null for min and max.
+- AVOID complex medical jargon. If you must use a medical term, explain it immediately in brackets.
+- USE analogies (e.g., "Think of your kidneys as your body's filter system").
+- IF THE OCR TEXT IS UNREADABLE, include "We couldn't quite read the details of this scan clearly. Could you please upload a clearer photo?"
+- Output ONLY the JSON object.
+
+Report text (STRICT DATA SOURCE): ${safeText}`;
+
+        const GROQ_API_KEY = process.env.GROQ_API_KEY;
+        const useGroq = GROQ_API_KEY && !GROQ_API_KEY.includes('your_groq');
+
+        console.log(`[AI ENGINE] ─────────────────────────────────────────────`);
+        console.log(`[AI ENGINE] Engine selected: ${useGroq ? '☁️  GROQ (fast)' : '🦙 OLLAMA (slow — local)'}`);
+        if (!useGroq) console.warn('[AI ENGINE] ⚠️  GROQ_API_KEY missing or placeholder. Falling back to local Ollama.');
+        console.log(`[AI ENGINE] Text length: ${safeText.length} chars`);
+
+        let response;
+        if (useGroq) {
+            console.log('[AI ENGINE] Calling Groq API...');
+            response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                model: 'llama-3.1-8b-instant',
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.1,
+                max_tokens: 2000,
+                response_format: { type: 'json_object' }
+            }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${GROQ_API_KEY}`
+                },
+                timeout: 20000
+            });
+        } else {
+            console.log('[AI ENGINE] Calling local Ollama (this will be slow)...');
+            response = await axios.post('http://127.0.0.1:11434/v1/chat/completions', {
+                model: 'llama3.2',
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.1,
+                max_tokens: 2000,
+                response_format: { type: 'json_object' }
+            }, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 60000
+            });
+        }
+
+        console.log('[AI ENGINE] ✅ Response received successfully.');
+        const rawContent = response.data.choices[0].message.content;
+
+        let parsed;
+        try {
+            parsed = JSON.parse(rawContent);
+        } catch (jsonErr) {
+            console.error('[AI ENGINE] JSON Fixup Required:', jsonErr.message);
+            // Fallback: If JSON is malformed, try to extract summary via regex as a safety net
+            const summaryMatch = rawContent.match(/"summary"\s*:\s*"(.*)"/s);
+            parsed = {
+                biomarkers: [],
+                summary: summaryMatch ? summaryMatch[1].replace(/\\n/g, '\n') : 'Analysis completed, but data formatting failed. Please try again.'
+            };
+        }
+
+        return {
+            biomarkers: Array.isArray(parsed.biomarkers) ? parsed.biomarkers : [],
+            summary: parsed.summary || 'Summary generation failed.'
+        };
+    } catch (error) {
+        console.error('[AI ENGINE ERROR]', error.message);
+        if (error.response) {
+            console.error('[AI ENGINE ERROR] Status:', error.response.status);
+            console.error('[AI ENGINE ERROR] Data:', JSON.stringify(error.response.data || ''));
+        }
+        return {
+            biomarkers: [],
+            summary: 'The medical analysis engine is currently busy. Please consult your doctor directly.'
+        };
+    }
+};
+
+/**
+ * generateDoctorBrief — Produces a concise, clinical-grade brief for the doctor's dashboard.
+ * Uses the same LLM engine as analyzeReportUniversal but with a doctor-specific prompt:
+ * terminology-rich, no analogies, no emojis, structured like a clinical notes entry.
+ */
+exports.generateDoctorBrief = async (ocrText, biomarkers = []) => {
+    try {
+        const safeText = String(ocrText || '').substring(0, 4000);
+        if (safeText.trim().length < 30) return 'Insufficient OCR data to generate clinical brief.';
+
+        // Build a compact biomarker summary for context
+        const abnormal = biomarkers.filter(b => b.isAbnormal || (b.severity && b.severity !== 'Normal'));
+        const bioSummary = abnormal.length > 0
+            ? abnormal.map(b => `${b.biomarkerName || b.name}: ${b.value} ${b.unit || ''} (${b.severity || 'Abnormal'})`).join('; ')
+            : 'All extracted biomarkers within reference range.';
+
+        const prompt = `You are a senior clinical consultant reviewing a lab report to brief a treating physician.
+
+Write a concise CLINICAL BRIEF (3–5 sentences) that:
+1. Identifies the panel type (e.g., "CBC", "LFT", "Lipid Profile", "Thyroid Function Test").
+2. States key abnormal findings with precise values and clinical interpretation (e.g., "Serum ALT elevated at 78 U/L, suggestive of hepatocellular stress").
+3. Notes any notable normal findings only if clinically relevant to rule out differentials.
+4. Closes with a brief differential/impression and recommended follow-up action (e.g., "Recommend repeat LFT in 4 weeks and hepatic ultrasound").
+
+STRICT RULES:
+- Use clinical/medical terminology (ICD-standard language). This is for a doctor, NOT a patient.
+- Do NOT use analogies, emojis, layman's terms, or motivational tone.
+- Do NOT start with greetings.
+- Keep the response under 120 words.
+- Output ONLY the plain text brief. No JSON, no markdown headers.
+
+Abnormal Biomarkers Detected: ${bioSummary}
+
+Raw Lab Report OCR Text:
+${safeText}`;
+
+        const GROQ_API_KEY = process.env.GROQ_API_KEY;
+        const useGroq = GROQ_API_KEY && !GROQ_API_KEY.includes('your_groq');
+
+        let response;
+        if (useGroq) {
+            response = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+                model: 'llama-3.1-8b-instant',
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.1,
+                max_tokens: 300
+            }, {
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+                timeout: 20000
+            });
+        } else {
+            response = await axios.post('http://127.0.0.1:11434/v1/chat/completions', {
+                model: 'llama3.2',
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.1,
+                max_tokens: 300
+            }, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 60000
+            });
+        }
+
+        const brief = response.data.choices[0].message.content.trim();
+        console.log(`[AI SERVICE] Doctor brief generated — ${brief.length} chars`);
+        return brief;
+    } catch (err) {
+        console.warn(`[AI SERVICE] Doctor brief generation failed: ${err.message}`);
+        return 'Clinical brief generation unavailable. Review raw biomarker data for assessment.';
+    }
+};
+
+const googleTTS = require('google-tts-api');
+
+exports.generateAudio = async (textSummary, language = 'en') => {
+    try {
+        const langMap = {
+            'english': 'en',
+            'hindi': 'hi',
+            'marathi': 'mr',
+            'telugu': 'te'
+        };
+        const isoCode = langMap[language.toLowerCase()] || language.toLowerCase() || 'en';
+
+        console.log(`[AI Service] Generating free TTS audio in language code: ${isoCode} (Original: ${language})`);
+
+        // Remove empty lines and limit size
+        const cleanText = textSummary.replace(/\n/g, ' ').substring(0, 1000);
+
+        // getAllAudioBase64 handles text chunking (Google TTS native limit is 200 chars)
+        const chunks = await googleTTS.getAllAudioBase64(cleanText, {
+            lang: isoCode,
+            slow: false,
+            host: 'https://translate.google.com',
+            timeout: 10000,
+        });
+
+        // Combine dynamically generated MP3 base64 chunks into a single readable buffer
+        const audioBuffers = chunks.map(chunk => Buffer.from(chunk.base64, 'base64'));
+        const combinedBuffer = Buffer.concat(audioBuffers);
+
+        return combinedBuffer;
+    } catch (error) {
+        console.error('Free TTS Error:', error.message);
+        // Fallback to silent WAV string if TTS fails
+        return Buffer.from("UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAwA=", 'base64');
+    }
+};
