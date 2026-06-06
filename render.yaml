@@ -1,0 +1,56 @@
+services:
+  - type: web
+    name: labvault-ocr
+    env: python
+    rootDir: ocr_service
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    nativeDependencies:
+      - packageManager: apt
+        packages:
+          - poppler-utils
+          - tesseract-ocr
+          - libgl1
+    envVars:
+      - key: GOOGLE_AI_STUDIO_API_KEY
+        sync: false
+
+  - type: web
+    name: labvault-backend
+    env: node
+    rootDir: backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ACCESS_TOKEN_SECRET
+        sync: false
+      - key: ACCESS_TOKEN_EXPIRY
+        value: 1d
+      - key: REFRESH_TOKEN_SECRET
+        sync: false
+      - key: REFRESH_TOKEN_EXPIRY
+        value: 10d
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_AI_STUDIO_API_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: OCR_SERVICE_URL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
