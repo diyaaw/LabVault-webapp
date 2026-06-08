@@ -24,10 +24,11 @@ const app = express();
 
 // ─── Core Middleware ──────────────────────────────────────────────────────────
 app.use(cors({
-    origin: function(origin, callback) {
+    origin: function (origin, callback) {
         if (!origin) return callback(null, true);
         if (origin.startsWith('http://localhost:')) return callback(null, true);
         if (origin.startsWith('http://127.0.0.1:')) return callback(null, true);
+        if (origin.startsWith('https://lab-vault-webapp.vercel.app')) return callback(null, true);
         if (origin === process.env.CORS_ORIGIN) return callback(null, true);
         callback(null, false);
     },
@@ -35,13 +36,13 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser()); 
+app.use(cookieParser());
 
 // Serve uploaded files as static assets
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
-app.use('/api/auth',    authRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/api/v2/auth', authV2Routes);   // full access + refresh token lifecycle
 app.use('/api/reports', reportRoutes);
 
