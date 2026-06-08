@@ -62,7 +62,7 @@ exports.signup = async (req, res) => {
             });
         } else if (role === 'doctor') {
             const licenseCertificateUrl = req.file
-                ? `/uploads/certificates/${req.file.filename}`
+                ? (req.file.path || req.file.secure_url || '')
                 : '';
             await DoctorProfile.create({
                 userId: user._id,

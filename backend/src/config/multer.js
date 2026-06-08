@@ -27,14 +27,18 @@ const reportStorage = new CloudinaryStorage({
     },
 });
 
-// Storage engine for doctor/pathology certificates → saves to local uploads/certificates/
-const certificateStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, 'uploads/certificates/');
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, `cert-${uniqueSuffix}${path.extname(file.originalname).toLowerCase()}`);
+// Storage engine for doctor/pathology certificates → uploads to Cloudinary certificates/ folder
+const certificateStorage = new CloudinaryStorage({
+    cloudinary,
+    params: (req, file) => {
+        const isPdf = file.mimetype === 'application/pdf';
+        const ext = path.extname(file.originalname).toLowerCase();
+        const baseName = path.parse(file.originalname).name;
+        return {
+            folder: 'certificates',
+            resource_type: isPdf ? 'raw' : 'auto',
+            public_id: `cert-${Date.now()}-${baseName}${isPdf ? ext : ''}`,
+        };
     },
 });
 
@@ -61,7 +65,7 @@ const upload = multer({
 // 5 MB limit for certificates (local disk — admin-only verification files)
 const uploadCertificate = multer({
     storage: certificateStorage,
-    limits: { fileSize: 5 * 1024 * 1024 },
+    limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter,
 });
 
