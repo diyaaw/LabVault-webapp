@@ -19,10 +19,12 @@ exports.extractBiomarkersFromDocument = async (filePath) => {
             formData.append('enable_preprocessing', 'true');
 
             // Send multipart request to the Refactored Python OCR Service
-            const response = await axios.post('http://127.0.0.1:5001/ocr/process', formData, {
+            const OCR_BASE_URL = process.env.OCR_SERVICE_URL || 'http://127.0.0.1:5001';
+            const response = await axios.post(`${OCR_BASE_URL}/ocr/process`, formData, {
                 headers: {
                     ...formData.getHeaders()
-                }
+                },
+                timeout: 60000
             });
 
             if (response.data && response.data.status === 'success') {
